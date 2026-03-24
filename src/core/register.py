@@ -14,7 +14,7 @@ from datetime import datetime
 from curl_cffi import requests as cffi_requests
 
 from .openai.oauth import OAuthManager, OAuthStart
-from .http_client import OpenAIHTTPClient, HTTPClientError
+from .http_client import OpenAIHTTPClient, HTTPClientError, SentinelTokenGenerator
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
 from ..database import crud
 from ..database.session import get_db
@@ -249,30 +249,63 @@ class RegistrationEngine:
         return None
 
     def _check_sentinel(self, did: str) -> Optional[str]:
-        """检查 Sentinel 拦截"""
+        """获取 Sentinel Token（含 PoW 挑战）"""
         try:
-            sen_req_body = f'{{"p":"","id":"{did}","flow":"authorize_continue"}}'
+            fp = self.http_client.fingerprint
+            generator = SentinelTokenGenerator(device_id=did, user_agent=fp["ua"])
+            req_body = json.dumps({
+                "p": generator.generate_requirements_token(),
+                "id": did,
+                "flow": "authorize_continue",
+            })
+            headers = {
+                "origin": "https://sentinel.openai.com",
+                "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
+                "content-type": "text/plain;charset=UTF-8",
+                "user-agent": fp["ua"],
+                "sec-ch-ua": fp["sec_ch_ua"],
+                "sec-ch-ua-mobile": fp["sec_ch_ua_mobile"],
+                "sec-ch-ua-platform": fp["sec_ch_ua_platform"],
+            }
 
             response = self.http_client.post(
                 OPENAI_API_ENDPOINTS["sentinel"],
-                headers={
-                    "origin": "https://sentinel.openai.com",
-                    "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
-                    "content-type": "text/plain;charset=UTF-8",
-                },
-                data=sen_req_body,
+                headers=headers,
+                data=req_body,
             )
 
-            if response.status_code == 200:
-                sen_token = response.json().get("token")
-                self._log(f"Sentinel token 获取成功")
-                return sen_token
-            else:
-                self._log(f"Sentinel 检查失败: {response.status_code}", "warning")
+            if response.status_code != 200:
+                self._log(f"Sentinel 挑战失败: HTTP {response.status_code}", "error")
                 return None
 
+            challenge = response.json()
+            c_value = challenge.get("token", "")
+            if not c_value:
+                self._log("Sentinel 挑战失败: 响应中无 token", "error")
+                return None
+
+            pow_data = challenge.get("proofofwork") or {}
+            if pow_data.get("required") and pow_data.get("seed"):
+                p_value = generator.generate_token(
+                    seed=pow_data["seed"],
+                    difficulty=pow_data.get("difficulty", "0"),
+                )
+            else:
+                p_value = generator.generate_requirements_token()
+
+            sentinel_token = json.dumps({
+                "p": p_value,
+                "t": "",
+                "c": c_value,
+                "id": did,
+                "flow": "authorize_continue",
+            }, separators=(",", ":"))
+
+            self._log("Sentinel token 获取成功")
+            return sentinel_token
+
         except Exception as e:
-            self._log(f"Sentinel 检查异常: {e}", "warning")
+            self._log(f"Sentinel 检查异常: {e}", "error")
             return None
 
     def _submit_signup_form(self, did: str, sen_token: Optional[str]) -> SignupFormResult:
@@ -293,8 +326,7 @@ class RegistrationEngine:
             }
 
             if sen_token:
-                sentinel = f'{{"p": "", "t": "", "c": "{sen_token}", "id": "{did}", "flow": "authorize_continue"}}'
-                headers["openai-sentinel-token"] = sentinel
+                headers["openai-sentinel-token"] = sen_token
 
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["signup"],

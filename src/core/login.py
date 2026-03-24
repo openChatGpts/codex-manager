@@ -254,7 +254,8 @@ class LoginEngine(RegistrationEngine):
             token_info = self.oauth_manager.handle_callback(
                 callback_url=callback_url,
                 expected_state=self.oauth_start.state,
-                code_verifier=self.oauth_start.code_verifier
+                code_verifier=self.oauth_start.code_verifier,
+                fingerprint=self.http_client.fingerprint
             )
 
             self._log("OAuth 授权成功")
